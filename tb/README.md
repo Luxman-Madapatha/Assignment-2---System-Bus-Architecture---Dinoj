@@ -1,120 +1,95 @@
-# Testbench Directory
+# Testbench Documentation
 
-This directory contains the verification suite for the bus architecture. The testbench files are responsible for exercising the RTL under controlled conditions and checking whether the hardware implementation behaves correctly for the expected bus transactions.
+This directory contains the verification suite used to evaluate the correctness of the shared bus architecture. The testbench files are HDL-based behavioral checks written to validate the RTL implementation under a range of operating conditions. These modules provide the functional evidence required to confirm that the design satisfies the specified bus protocol and address-mapping requirements.
 
-## Purpose
+## 1. Scope of Verification
 
-The testbenches validate the design at different levels of abstraction:
+The testbench suite is designed to verify the following system aspects:
 
-- low-level arbitration checks
-- address decoding and boundary validation
-- end-to-end bus protocol checks
-- board-to-board interconnect simulation
+- arbitration policy
+- reset and idle-state operation
+- address decode correctness
+- memory-mapped slave selection
+- read and write transaction behavior
+- unmapped-address handling
+- end-to-end bus protocol operation
+- board-to-board signal propagation
 
-These files are the main proving ground for the repository. In a typical HDL project, they verify correctness before synthesis or deployment.
+The tests are intentionally structured to isolate subsystem behavior before progressing to more complex system-level validation.
 
-## Testbench files
+## 2. Testbench Set
 
-The project includes these four major testbenches:
+The repository contains four primary testbench files:
 
 - `tb_arbiter.v`
 - `tb_addr_decoder.v`
 - `tb_top.v`
 - `tb_two_boards.v`
 
-## File descriptions
+### 2.1 `tb_arbiter.v`
 
-### `tb_arbiter.v`
+This testbench validates the `arbiter.v` module. It is intended to confirm that:
 
-This testbench verifies the corrected priority-based arbitration behavior in `rtl/arbiter.v`.
+- `M0` has higher priority than `M1`
+- the grant remains active until the request is released
+- no mid-transaction preemption occurs
+- the `busy` signal is asserted under active bus ownership
+- the reset state returns the bus to the idle condition
 
-It checks that:
+This is the most direct verification of the arbitration behavior specified by the hardware design.
 
-- the bus is idle at reset
-- `M0` receives grant first when both masters request the bus
-- `M1` is served only when `M0` is not requesting
-- the active grant persists until the current request is released
-- no preemption occurs mid-transaction
-- the `busy` flag reflects bus ownership correctly
+### 2.2 `tb_addr_decoder.v`
 
-Use cases:
+This testbench confirms the response of the address decoder to the memory map. It checks the proper selection of:
 
-- confirm priority ordering
-- validate hold-time behavior
-- ensure that grant transitions are deterministic and safe
+- S0 for the lower address region
+- S1 for the upper address region
+- S2 for the 2 KB restricted region
+- no valid selection for unmapped addresses
 
-### `tb_addr_decoder.v`
+In addition, the file verifies boundary conditions at the address transitions used by the design. These checks are essential for confirming that the implemented memory map matches the specification.
 
-This testbench targets the logic in `rtl/addr_decoder.v`.
+### 2.3 `tb_top.v`
 
-It verifies that:
+This testbench is the main behavioral validation of the full bus controller. It exercises the entire shared bus implementation and confirms:
 
-- address ranges are decoded to the expected slave
-- `S0`, `S1`, and `S2` are selected correctly
-- boundary addresses such as `0x0FFF`, `0x1000`, `0x1FFF`, `0x2000`, and `0x2800` are treated properly
-- unmapped addresses produce no valid slave selection
-- `hit` correctly indicates whether an address is valid
+- arbitration between two masters
+- correct operation of the decode logic
+- sequencing across transaction beats
+- completion of read and write cycles
+- response generation and valid `m_rdata`
+- safe behavior when addresses are unmapped
+- correct dec_err signaling
 
-This testbench is essential for confirming the memory map used by the bus system.
+This is the central verification target of the repository and is the most comprehensive functional check of the design.
 
-### `tb_top.v`
+### 2.4 `tb_two_boards.v`
 
-This is the most important simulation testbench for the design.
+This testbench models the board-to-board interconnect used in the FPGA hardware implementation. It verifies the functional assumptions associated with the distributed bus design:
 
-It exercises the full shared-bus controller implemented in `rtl/bus_top.v` and verifies:
+- one board acts as the shared bus resource
+- the second board contains the master and slave logic
+- bus signals interconnect across FPGA boundaries
+- transaction semantics remain valid under board-to-board communication assumptions
 
-- arbitration with two masters
-- decode of the target slave
-- bus beat sequencing
-- read transaction completion
-- write transaction completion
-- unmapped accesses returning a safe response
-- decode-error handling
-- contention and bus release behavior
+This test is essential for validating the physical architecture of the project beyond the isolated RTL simulation environment.
 
-This testbench is the closest match to the full system behavior and is used to validate the actual bus protocol implementation.
+## 3. Verification Methodology
 
-### `tb_two_boards.v`
+The testbenches generally follow a standard verification approach:
 
-This testbench validates the board-to-board communication model used by the FPGA implementation.
+1. stimulus generation
+2. clock and reset application
+3. functional excitation
+4. signal observation
+5. expected-result assertion
+6. failure detection and debugging
 
-It simulates the case where:
+This pattern provides reproducible validation and allows errors to be localized to specific modules.
 
-- one board acts as the bus controller / shared resource
-- the other board contains masters and slave memory
-- GPIO-style signals pass between the two logical boards
-- timing and interconnect assumptions are tested in a realistic system-level setup
+## 4. Execution Strategy
 
-This test is important for validating the system’s distributed hardware concept and confirming that the design remains coherent when the bus is physically split across two DE0 boards.
-
-## Typical simulation pattern
-
-Each testbench follows a standard pattern:
-
-1. define module under test
-2. create clock and reset stimulus
-3. drive requests and addresses
-4. observe outputs such as grants, select lines, read data, and ready pulses
-5. assert expected behavior with self-checking conditions
-
-The assertions are designed to fail if the bus does not meet the expected protocol.
-
-## Typical verification goals
-
-Across the suite, the following behaviors are checked repeatedly:
-
-- reset defaults are correct
-- bus is inactive when no request is present
-- grant is awarded to the correct master
-- master cannot be preempted during its active transaction
-- address range decoding is correct
-- valid read returns data
-- invalid address returns safe default data
-- bus recovers cleanly after a request completes
-
-## Command-line execution
-
-The project includes direct Icarus Verilog commands for running all tests quickly:
+The repository provides a direct command-line compilation flow for running the testbenches:
 
 ```bash
 iverilog -g2005 -o arb  rtl/*.v tb/tb_arbiter.v      && vvp arb
@@ -122,32 +97,3 @@ iverilog -g2005 -o dec  rtl/*.v tb/tb_addr_decoder.v && vvp dec
 iverilog -g2005 -o top  rtl/*.v tb/tb_top.v          && vvp top
 iverilog -g2005 -P tb_top.NODE_CLK_INV=1 -o topi rtl/*.v tb/tb_top.v && vvp topi
 iverilog -g2005 -o two  rtl/*.v fpga/*.v tb/tb_two_boards.v && vvp two
-```
-
-These commands provide an easy path for CI-style simulation or quick verification from the shell.
-
-## Relationship to the simulation scripts
-
-The `sim/` directory contains the `.do` files that run the testbench flows in ModelSim/Questa, while the `tb/` directory contains the actual queued test stimuli and checking logic.
-
-In practical terms:
-
-- `tb/*.v` = scenarios and assertions
-- `sim/*.do` = script wrapper and waveform viewer setup
-
-## Recommended validation order
-
-A sensible validation flow is:
-
-1. run `tb_arbiter.v`
-2. run `tb_addr_decoder.v`
-3. run `tb_top.v`
-4. run `tb_two_boards.v`
-
-This order builds confidence from the simplest subsystem to the fully integrated bus design.
-
-## Summary
-
-The `tb/` folder is the behavioral verification layer of the project. It provides the test scenarios needed to confirm that the bus protocol, arbitration logic, decode map, and board-level interconnect all behave as intended.
-
-If you want to understand whether the design is correct, start here.
