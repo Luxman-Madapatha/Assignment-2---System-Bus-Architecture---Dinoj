@@ -1,28 +1,24 @@
 //============================================================================
 // bus_top.v : top-level shared bus controller for 2 masters and 3 slaves
 //
-// This module is the central bus controller. It combines the following blocks:
-//   - arbiter       : selects the active master
-//   - master mux    : routes the granted master's bus beats onto the shared bus
-//   - addr_decoder  : determines which slave should respond
-//   - transaction tracking : counts bus beats during each transfer
-//   - response logic : generates m_ready and m_rdata on completion
+// Functional summary:
+//   - Coordinates bus ownership between M0 and M1.
+//   - Multiplies the granted master's data onto the shared bus.
+//   - Decodes the target slave during the HEADER beat.
+//   - Tracks beat progression across a transaction.
+//   - Returns read data and ready signal at transaction completion.
+//   - Prevents bus deadlock for unmapped addresses.
 //
-// Transaction format:
-//   beat 0  HEADER  = {RW, 1'b0, A[13:8]}  ; RW=1 for write, RW=0 for read
-//   beat 1  ADDR_LO = A[7:0]
-//   beat 2  WDATA   (only used for write transactions)
-//   response: bus returns m_ready and m_rdata for read operations
+// Transaction protocol:
+//   beat 0 : HEADER  = {RW, 1'b0, A[13:8]}
+//   beat 1 : ADDR_LO = A[7:0]
+//   beat 2 : WDATA   (write transactions only)
+//   response: m_ready pulse and m_rdata for read transactions
 //
-// Notes on timing:
-//   - The slave interface uses fixed latency; there is no explicit slave ready.
-//   - A slave read data is valid a short time after the ADDR_LO beat.
-//   - The top-level bus returns m_ready after the response delay.
-//   - Invalid/unmapped addresses still complete safely and do not lock the bus.
-//
-// Reset and clock semantics:
-//   - asynchronous active-low reset
-//   - rising-edge clocking
+// Timing model:
+//   - Asynchronous active-low reset.
+//   - Rising-edge clocking.
+//   - Fixed-latency read response.
 //============================================================================
 module bus_top #(
     parameter [7:0] UNMAPPED_RDATA = 8'hEE
@@ -30,44 +26,58 @@ module bus_top #(
     input  wire       clk,
     input  wire       rst_n,
 
-    // -------------------------- Master 0 interface --------------------------
+    // --------------------------------------------------------------------------
+    // Master 0 interface.
+    // --------------------------------------------------------------------------
     input  wire       m0_req,
     input  wire       m0_valid,
     input  wire [7:0] m0_dout,
     output wire       m0_gnt,
 
-    // -------------------------- Master 1 interface --------------------------
+    // --------------------------------------------------------------------------
+    // Master 1 interface.
+    // --------------------------------------------------------------------------
     input  wire       m1_req,
     input  wire       m1_valid,
     input  wire [7:0] m1_dout,
     output wire       m1_gnt,
 
-    // --------------------- Shared response interface ------------------------
-    // These outputs are returned to the active master based on the granted ID.
+    // --------------------------------------------------------------------------
+    // Shared response interface.
+    // These outputs are returned to the active master as the bus transaction is
+    // completed.
+    // --------------------------------------------------------------------------
     output reg  [7:0] m_rdata,
     output reg        m_ready,
 
-    // ----------------------- Broadcast to all slaves ------------------------
-    // The selected bus beat is forwarded to every slave; the slave decode logic
-    // determines whether that slave should respond.
+    // --------------------------------------------------------------------------
+    // Broadcast slave interface.
+    // Every slave sees the same bus beat, and each slave decides whether it is the
+    // destination using s_sel and s_valid.
+    // --------------------------------------------------------------------------
     output reg  [7:0] s_wdata,
     output reg        s_valid,
     output reg  [1:0] s_sel,
 
-    // --------------------- Slave read-data inputs ---------------------------
+    // --------------------------------------------------------------------------
+    // Slave read-data inputs.
+    // --------------------------------------------------------------------------
     input  wire [7:0] s0_rdata,
     input  wire [7:0] s1_rdata,
     input  wire [7:0] s2_rdata,
 
-    // ---------------------------- Status outputs ----------------------------
+    // --------------------------------------------------------------------------
+    // Status outputs.
+    // --------------------------------------------------------------------------
     output wire       busy,
     output reg        dec_err
 );
 
-    //--------------------------------------------------------------------------
-    // Arbiter instance.
-    // The arbiter decides which master currently owns the bus.
-    //--------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // Block: Arbiter Instance
+    // --------------------------------------------------------------------------
+    // The arbiter decides which master owns the bus at the current clock cycle.
+    // --------------------------------------------------------------------------
     wire gnt0, gnt1;
     arbiter u_arbiter (
         .clk(clk),
@@ -80,21 +90,23 @@ module bus_top #(
     );
     assign m0_gnt = gnt0;
     assign m1_gnt = gnt1;
-    wire granted  = gnt0 | gnt1; // bus is active if either grant is asserted
+    wire granted = gnt0 | gnt1; // bus is active if either grant is high
 
-    //--------------------------------------------------------------------------
-    // Master-to-bus multiplexing.
-    // A master is selected based on its grant. The data from the granted master is
-    // forwarded to the bus, while the non-selected master's data is ignored.
-    //--------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // Block: Master-to-Bus Multiplexing
+    // --------------------------------------------------------------------------
+    // The active master's data is routed onto the shared bus by the grant signal.
+    // The non-selected master is ignored.
+    // --------------------------------------------------------------------------
     wire       mux_valid = gnt0 ? m0_valid : (gnt1 ? m1_valid : 1'b0);
     wire [7:0] mux_data  = gnt0 ? m0_dout  : (gnt1 ? m1_dout  : 8'h00);
 
-    //--------------------------------------------------------------------------
-    // Address decoder instance.
-    // The upper address bits are sampled from the header beat, and the selected
-    // slave is identified combinationally.
-    //--------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // Block: Address Decoder Instance
+    // --------------------------------------------------------------------------
+    // The upper address bits are sampled from the HEADER beat and decoded to a
+    // selected slave target. This is a combinational block.
+    // --------------------------------------------------------------------------
     wire [2:0] dec_onehot;
     wire [1:0] dec_code;
     wire       dec_hit;
@@ -105,32 +117,39 @@ module bus_top #(
         .hit(dec_hit)
     );
 
-    //--------------------------------------------------------------------------
-    // Transaction tracking registers.
-    // The system time-shares the same 8 data lines across multiple bus beats.
-    // 'beat' tracks how far a transaction has progressed.
-    // 'rw_q' stores the direction of the current transfer.
-    // 'hit_q' stores whether the address was mapped to a valid slave.
-    // 'resp_pipe' introduces a short delay before the transaction is completed.
-    //--------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
+    // Block: Transaction Tracking Registers
+    // --------------------------------------------------------------------------
+    // beat      : tracks the current transfer beat within a transaction
+    // rw_q      : stores the direction of the present transaction
+    // hit_q     : stores whether the address maps to a legal slave
+    // resp_pipe : delay pipeline used to time the read response
+    //
+    // Protocol timing:
+    //   - beat = 0 : HEADER beat
+    //   - beat = 1 : ADDR_LO beat
+    //   - beat = 2 : WDATA beat (write only)
+    //   - after completion: m_ready pulse generated and state resets
+    // --------------------------------------------------------------------------
     reg  [1:0] beat;        // 0..3 transaction beat counter
-    reg        rw_q;        // 1=write, 0=read
-    reg        hit_q;       // decode result from header beat
+    reg        rw_q;        // rw_q = 1 => write, 0 => read
+    reg        hit_q;       // decode result from the header beat
     reg  [1:0] resp_pipe;   // response delay pipeline
 
-    // hdr_beat is true when the current bus beat is the HEADER beat.
-    wire hdr_beat  = mux_valid & (beat == 2'd0);
+    // hdr_beat is true only during the HEADER beat of the active transaction.
+    wire hdr_beat = mux_valid & (beat == 2'd0);
 
-    // last_beat indicates the final operand beat for the current transaction.
-    // For reads, the final beat is ADDR_LO.
-    // For writes, the final beat is WDATA.
+    // last_beat marks the final beat of the current transfer.
+    // For a read, the final beat is ADDR_LO.
+    // For a write, the final beat is WDATA.
     wire last_beat = mux_valid & ((~rw_q & (beat == 2'd1)) |
                                   ( rw_q & (beat == 2'd2)));
 
     // --------------------------------------------------------------------------
-    // Slave read-data multiplexer.
-    // When a read transaction completes, the bus returns the selected slave's
-    // data. This multiplexer selects the proper slave read port based on s_sel.
+    // Block: Slave Read-Data Multiplexer
+    // --------------------------------------------------------------------------
+    // The selected slave data is forwarded onto the response bus only after the
+    // read operation completes.
     // --------------------------------------------------------------------------
     reg [7:0] s_rdata_mux;
     always @(*) begin
@@ -143,13 +162,18 @@ module bus_top #(
     end
 
     // --------------------------------------------------------------------------
-    // Main bus control FSM.
-    // The bus updates on every rising edge. Response logic is generated after a
-    // small delay to emulate the fixed-latency slave behavior.
+    // Block: Main Bus Control Logic
+    // --------------------------------------------------------------------------
+    // State progression:
+    //   - At reset: all outputs are cleared and bus is idle.
+    //   - On HEADER beat: decode and latch transfer metadata.
+    //   - On ADDR_LO beat: the address is finalized.
+    //   - On WDATA beat: write data is transferred.
+    //   - On completion: m_ready is asserted and transaction is cleared.
     // --------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            // Reset all control and status signals to a safe idle state.
+            // Reset state: clear bus data, ready, beat counter, and decode result.
             s_wdata   <= 8'h00;
             s_valid   <= 1'b0;
             s_sel     <= 2'd0;
@@ -161,31 +185,31 @@ module bus_top #(
             resp_pipe <= 2'b00;
             dec_err   <= 1'b0;
         end else begin
-            // Default operation: broadcast the active master's current bus beat to
-            // all slave devices and hold ready low until completion.
+            // ------------------------------------------------------------------
+            // Default update: broadcast the current bus beat to all slaves.
+            // ------------------------------------------------------------------
             s_wdata   <= mux_data;
             s_valid   <= mux_valid;
             m_ready   <= 1'b0;
             resp_pipe <= {resp_pipe[0], last_beat};
 
             if (hdr_beat) begin
-                // Header beat: latch the transfer direction and decode result.
-                // This is the point at which the destination slave is determined.
-                rw_q    <= mux_data[7];      // bit 7 = RW: 1 for write, 0 for read
-                hit_q   <= dec_hit;         // whether the address maps to a valid slave
-                s_sel   <= dec_code;        // pass selected slave code to slave devices
-                dec_err <= ~dec_hit;        // error if address is not mapped
-                beat    <= 2'd1;            // move to address-low beat
+                // Timing: HEADER beat at cycle N -> decode and latch transaction info.
+                // Protocol: capture read/write direction and valid slave selection.
+                rw_q    <= mux_data[7];      // bit 7 = 1 for write, 0 for read
+                hit_q   <= dec_hit;          // decoded validity of target address
+                s_sel   <= dec_code;         // selected slave code is latched here
+                dec_err <= ~dec_hit;         // error if address is unmapped
+                beat    <= 2'd1;             // move to ADDR_LO phase on next cycle
             end else if (mux_valid && beat != 2'd3) begin
-                // Advance to the next transaction beat when a valid beat is still
-                // being transferred and the maximum transaction depth has not been
-                // reached.
+                // Timing: each subsequent valid bus beat increments the beat counter.
+                // Protocol: ADDR_LO -> WDATA -> response completion.
                 beat <= beat + 2'd1;
             end
 
             if (resp_pipe[1]) begin
-                // Transaction complete: assert m_ready and return valid data for
-                // reads, or zero for writes.
+                // Timing: response pipeline completes after the fixed slave latency.
+                // Protocol: m_ready pulse is generated, and read data is returned.
                 m_ready <= 1'b1;
                 m_rdata <= rw_q ? 8'h00 :
                            hit_q ? s_rdata_mux : UNMAPPED_RDATA;
@@ -194,8 +218,8 @@ module bus_top #(
             end
 
             if (!granted) begin
-                // If no master is currently granted, clear the state to prevent
-                // stale selects or old bus phase information from lingering.
+                // Timing: if no master is granted, the bus must be considered idle.
+                // This clears stale select and beat information.
                 s_sel     <= 2'd0;
                 beat      <= 2'd0;
                 resp_pipe <= 2'b00;

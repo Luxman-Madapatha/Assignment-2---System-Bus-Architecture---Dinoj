@@ -1,104 +1,117 @@
 //============================================================================
 // arbiter.v : Fixed-priority, non-preemptive arbiter for 2 masters
 //
-// The bus is a shared resource. Only one master may be granted ownership at a
-// time. This arbiter implements a simple static-priority policy:
-//   - Master 0 has the highest priority.
-//   - Master 1 has the lower priority.
-//   - Once a master is granted the bus, it retains ownership until it releases
-//     its request.
-//   - The arbiter is non-preemptive; it does not interrupt an ongoing transfer.
+// Functional summary:
+//   - M0 has higher priority than M1.
+//   - Only one master is granted access at any time.
+//   - The grant remains active until the current request is released.
+//   - No mid-transaction preemption is allowed.
+//   - The bus is idle when no master requests ownership.
 //
-// State encoding:
-//   IDLE = 2'b00   -> no bus owner
-//   M0   = 2'b01   -> grant to master 0
-//   M1   = 2'b10   -> grant to master 1
-//
-// The state bit ordering is intentionally chosen to match the grant outputs:
-//   state[0] -> gnt0
-//   state[1] -> gnt1
-//
-// A synchronous rising-edge clock is used, with an asynchronous active-low
-// reset (rst_n) to bring the state machine back to IDLE.
+// Timing model:
+//   - Rising-edge clocked state machine.
+//   - Asynchronous active-low reset (rst_n).
+//   - Grant outputs are directly driven from the state register.
 //============================================================================
 module arbiter (
     input  wire clk,
     input  wire rst_n,
 
-    // Request lines from the two masters.
-    // A request is asserted when the master wants to use the shared bus.
+    // --------------------------------------------------------------------------
+    // Input request interfaces.
+    // Each master asserts reqN when it wants exclusive access to the shared bus.
+    // --------------------------------------------------------------------------
     input  wire req0,
     input  wire req1,
 
-    // Grant lines to the masters.
-    // Exactly one grant may be high at any given time.
+    // --------------------------------------------------------------------------
+    // Grant outputs.
+    // Exactly one grant may be asserted at any time.
+    // --------------------------------------------------------------------------
     output wire gnt0,
     output wire gnt1,
 
-    // busy is asserted whenever the arbiter is in an active grant state.
+    // --------------------------------------------------------------------------
+    // Busy flag.
+    // busy = 1 indicates that the bus is currently owned by M0 or M1.
+    // --------------------------------------------------------------------------
     output wire busy
 );
 
-    // State encoding matches the required grant outputs.
+    // --------------------------------------------------------------------------
+    // State encoding.
+    // The state value is also the grant vector, which keeps the logic compact and
+    // ensures glitch-free grant outputs.
+    // --------------------------------------------------------------------------
     localparam [1:0] IDLE = 2'b00,
                      M0   = 2'b01,
                      M1   = 2'b10;
 
+    // --------------------------------------------------------------------------
     // State and next-state registers.
-    // The current state is the actual grant state of the arbiter.
+    // state represents the current bus owner.
+    // next_state is computed combinationally before the next clock edge.
+    // --------------------------------------------------------------------------
     reg [1:0] state, next_state;
 
     // --------------------------------------------------------------------------
-    // Next-state generation.
-    // The arbiter gives priority to M0 whenever it requests the bus.
-    // If M0 is not active, M1 is granted when it requests the bus.
-    // If neither master requests the bus, the arbiter returns to IDLE.
-    // Once a grant is active, the bus remains owned by that master until the
-    // request is removed. This is non-preemptive arbitration.
+    // Block: Next-State Logic
+    // --------------------------------------------------------------------------
+    // Priority policy:
+    //   1. If M0 requests, M0 wins immediately.
+    //   2. Else if M1 requests, M1 wins.
+    //   3. Else the bus becomes idle.
+    //
+    // Timing semantics:
+    //   - IDLE -> M0 when req0 is high at the clock edge.
+    //   - IDLE -> M1 when req1 is high and req0 is low.
+    //   - M0 -> M0 while req0 remains high.
+    //   - M0 -> M1 when req0 drops and req1 is high.
+    //   - M1 -> M1 while req1 remains high.
+    //   - M1 -> M0 when req1 drops and req0 is high.
     // --------------------------------------------------------------------------
     always @(*) begin
         case (state)
             IDLE: begin
-                if      (req0) next_state = M0;     // Highest-priority request wins
-                else if (req1) next_state = M1;     // Lower-priority request wins next
-                else           next_state = IDLE;   // No request: bus idle
+                if      (req0) next_state = M0;     // Timing: M0 request is granted at next active edge
+                else if (req1) next_state = M1;     // Timing: M1 request is granted at next active edge
+                else           next_state = IDLE;   // Timing: bus remains idle, no active grant
             end
 
             M0: begin
-                if      (req0) next_state = M0;     // M0 remains master while it keeps req0 high
-                else if (req1) next_state = M1;     // Allow handoff when M0 releases bus
-                else           next_state = IDLE;   // No active request: release bus
+                if      (req0) next_state = M0;     // Timing: hold grant while M0 keeps req0 asserted
+                else if (req1) next_state = M1;     // Timing: M1 gains grant after M0 releases the bus
+                else           next_state = IDLE;   // Timing: grant is released when req0 goes low
             end
 
             M1: begin
-                if      (req1) next_state = M1;     // M1 keeps ownership while it requests
-                else if (req0) next_state = M0;     // M0 can grab bus when M1 releases it
-                else           next_state = IDLE;   // No request: clear bus ownership
+                if      (req1) next_state = M1;     // Timing: hold grant while M1 keeps req1 asserted
+                else if (req0) next_state = M0;     // Timing: M0 regains grant when M1 releases the bus
+                else           next_state = IDLE;   // Timing: no request -> bus is idle
             end
 
-            default: next_state = IDLE; // Safe default for unknown state values
+            default: next_state = IDLE; // Safe fail-safe state for unknown condition
         endcase
     end
 
     // --------------------------------------------------------------------------
-    // State register update.
-    // Synchronous state machine: the new state is loaded on each rising clock
-    // edge. The active-low reset returns the logic to IDLE immediately.
+    // Block: State Register Update
+    // --------------------------------------------------------------------------
+    // The arbiter state changes only on the rising clock edge. This ensures a
+    // synchronous state machine and clean grant transitions.
     // --------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= IDLE; // Reset clears bus ownership
+            state <= IDLE; // Timing: reset clears bus ownership immediately
         end else begin
-            state <= next_state; // Advance to next arbitration state
+            state <= next_state; // Timing: next state is loaded at the next active edge
         end
     end
 
     // --------------------------------------------------------------------------
-    // Grant outputs and busy flag.
-    // The state register itself is the grant vector. This keeps the implementation
-    // simple and avoids extra grant decoding logic.
+    // Block: Output Generation
     // --------------------------------------------------------------------------
-    assign gnt0 = state[0]; // state = M0 -> gnt0 = 1
-    assign gnt1 = state[1]; // state = M1 -> gnt1 = 1
-    assign busy = |state;    // busy = 1 when in M0 or M1 state
+    assign gnt0 = state[0]; // state = M0 -> gnt0 = 1, otherwise 0
+    assign gnt1 = state[1]; // state = M1 -> gnt1 = 1, otherwise 0
+    assign busy = |state;   // busy = 1 when in M0 or M1 grant states
 endmodule
