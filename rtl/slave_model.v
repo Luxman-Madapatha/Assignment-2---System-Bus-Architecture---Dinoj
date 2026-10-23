@@ -1,79 +1,156 @@
 //============================================================================
-// slave_model.v : memory slave (byte wide, 2^ADDR_W bytes)
-//   SLAVE_ID : select code this slave answers to (1, 2 or 3)
-//   ADDR_W   : 12 -> 4 KB, 11 -> 2 KB   (local address = A[ADDR_W-1:0])
+// master_model.v : behavioral bus master model
 //
-//   beat 0 (HEADER)  : latch RW and the upper local address bits
-//   beat 1 (ADDR_LO) : form address; read -> RAM read now
-//   beat 2 (WDATA)   : write -> RAM write
-//   Read data is valid on s_rdata one clock after ADDR_LO and is held
-//   until the next read (fixed-latency slave).
-//   Memory is a synchronous RAM so Quartus maps it to M9K block RAM.
-//   Control logic: asynchronous active-low reset, rising-edge clock.
+// This module models a single bus master in a very simple but realistic way.
+// It accepts a command from the testbench or a higher-level controller, waits
+// for bus ownership, drives the transaction sequence onto the shared bus, and
+// captures the returned read data when the transfer is complete.
+//
+// Command sequence:
+//   1. start pulse is received while the master is idle
+//   2. request is asserted on the bus
+//   3. bus grant is awaited
+//   4. HEADER beat is driven
+//   5. ADDR_LO beat is driven
+//   6. for writes, WDATA beat is driven
+//   7. wait for bus_ready after the slave response delay
+//   8. capture read data if this is a read
+//   9. release the request and return to idle
+//
+// Reset is asynchronous active-low. Clocking is rising-edge sensitive.
 //============================================================================
-module slave_model #(
-    parameter [1:0] SLAVE_ID = 2'd1,
-    parameter       ADDR_W   = 12
-)(
-    input  wire       clk,
-    input  wire       rst_n,
-    input  wire [1:0] s_sel,
-    input  wire       s_valid,
-    input  wire [7:0] s_wdata,
-    output wire [7:0] s_rdata
+module master_model (
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // ---- command side (UI or testbench) ----
+    input  wire        start,      // one-cycle pulse accepted only when idle
+    input  wire        rw,         // 1 = write, 0 = read
+    input  wire [13:0] addr,       // full 14-bit address
+    input  wire [7:0]  wdata,      // write data for write transactions
+
+    // ---- status outputs ----
+    output reg  [7:0]  rdata,      // last successfully read data
+    output reg         done,       // one-cycle pulse when transaction completes
+    output wire        busy,
+
+    // ---- bus side ----
+    output reg         req,        // request line asserted when master wants bus
+    input  wire        gnt,        // grant from bus arbiter
+    output reg         valid,      // indicates the bus beat is valid
+    output reg  [7:0]  dout,       // bus data to drive onto the shared bus
+    input  wire [7:0]  bus_rdata,  // returned data from the selected slave
+    input  wire        bus_ready   // response valid signal from the bus
 );
-    localparam DEPTH = 1 << ADDR_W;
-    localparam HI_W  = ADDR_W - 8;          // address bits in the header
 
-    reg [7:0]        mem [0:DEPTH-1];
-    reg [7:0]        rd_q;
-    reg [1:0]        beat;
-    reg              rw_q;
-    reg [HI_W-1:0]   addr_hi_q;
-    reg [ADDR_W-1:0] addr_q;
+    // --------------------------------------------------------------------------
+    // State machine encoding.
+    // This finite-state machine models the master's expected transaction flow.
+    // --------------------------------------------------------------------------
+    localparam [2:0] S_IDLE = 3'd0,  // waiting for a command from the testbench
+                     S_REQ  = 3'd1,  // request asserted, waiting for grant
+                     S_HDR  = 3'd2,  // drive HEADER beat
+                     S_ALO  = 3'd3,  // drive ADDR_LO beat
+                     S_DAT  = 3'd4,  // drive WDATA beat for writes
+                     S_WAIT = 3'd5,  // wait for bus_ready
+                     S_REL  = 3'd6;  // drop request and wait for grant release
 
-    wire              selected = (s_sel == SLAVE_ID);
-    wire              beat_en  = selected & s_valid;
-    wire [ADDR_W-1:0] cur_addr = {addr_hi_q, s_wdata};
-    wire              mem_we   = beat_en & (beat == 2'd2) &  rw_q;
-    wire              mem_re   = beat_en & (beat == 2'd1) & ~rw_q;
+    reg [2:0]  state;
+    reg        rw_q;
+    reg [13:0] addr_q;
+    reg [7:0]  wdata_q;
 
-    // ---- synchronous RAM (no reset on the array, as for block RAM) ----
-    always @(posedge clk) begin
-        if (mem_we) mem[addr_q] <= s_wdata;
-        if (mem_re) rd_q        <= mem[cur_addr];
-    end
-    assign s_rdata = rd_q;
-
-    // ---- beat sequencer ----
+    // --------------------------------------------------------------------------
+    // Main state-machine behavior.
+    // The master is responsible for generating the correct bus protocol sequence.
+    // --------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            beat <= 2'd0; rw_q <= 1'b0; addr_hi_q <= {HI_W{1'b0}};
-            addr_q <= {ADDR_W{1'b0}};
-        end else if (!selected) begin
-            beat <= 2'd0;
-        end else if (s_valid) begin
-            case (beat)
-                2'd0: begin
-                          rw_q      <= s_wdata[7];
-                          addr_hi_q <= s_wdata[HI_W-1:0];
-                          beat      <= 2'd1;
-                      end
-                2'd1: begin
-                          addr_q <= cur_addr;
-                          beat   <= rw_q ? 2'd2 : 2'd0;
-                      end
-                default: beat <= 2'd0;
+            // Reset the master to a known idle state.
+            state <= S_IDLE;
+            req   <= 1'b0;
+            valid <= 1'b0;
+            dout  <= 8'h00;
+            rdata <= 8'h00;
+            done  <= 1'b0;
+            rw_q  <= 1'b0;
+            addr_q <= 14'd0;
+            wdata_q <= 8'h00;
+        end else begin
+            done <= 1'b0; // done is a one-cycle pulse only; default is low
+
+            case (state)
+                S_IDLE: begin
+                    if (start) begin
+                        // Capture the command parameters before the request is sent.
+                        rw_q    <= rw;
+                        addr_q  <= addr;
+                        wdata_q <= wdata;
+                        req     <= 1'b1; // Assert bus request
+                        state   <= S_REQ;
+                    end
+                end
+
+                S_REQ: begin
+                    if (gnt) begin
+                        // Once granted, the master starts the transaction stream.
+                        valid <= 1'b1;
+                        dout  <= {rw_q, 1'b0, addr_q[13:8]}; // HEADER = {RW, 0, A[13:8]}
+                        state <= S_HDR;
+                    end
+                end
+
+                S_HDR: begin
+                    // Drive the low address byte on the next bus beat.
+                    dout  <= addr_q[7:0];
+                    state <= S_ALO;
+                end
+
+                S_ALO: begin
+                    if (rw_q) begin
+                        // A write operation sends write data after the address-low beat.
+                        dout  <= wdata_q;
+                        state <= S_DAT;
+                    end else begin
+                        // A read operation does not send WDATA; the bus waits for the
+                        // slave response instead.
+                        valid <= 1'b0;
+                        dout  <= 8'h00;
+                        state <= S_WAIT;
+                    end
+                end
+
+                S_DAT: begin
+                    // Write transaction data phase is complete. Stop driving valid
+                    // data and wait for the slave to acknowledge the transaction.
+                    valid <= 1'b0;
+                    dout  <= 8'h00;
+                    state <= S_WAIT;
+                end
+
+                S_WAIT: begin
+                    if (gnt && bus_ready) begin
+                        // The bus has completed the transfer. Capture read data for
+                        // read transactions and then drop the request.
+                        if (!rw_q) rdata <= bus_rdata;
+                        req  <= 1'b0;
+                        done <= 1'b1;
+                        state <= S_REL;
+                    end
+                end
+
+                S_REL: begin
+                    // Wait until the bus grant is released before returning to idle.
+                    if (!gnt) state <= S_IDLE;
+                end
+
+                default: begin
+                    state <= S_IDLE;
+                end
             endcase
         end
     end
 
-    // simulation only: start with a cleared memory
-    // synthesis translate_off
-    integer i;
-    initial begin
-        for (i = 0; i < DEPTH; i = i + 1) mem[i] = 8'h00;
-        rd_q = 8'h00;
-    end
-    // synthesis translate_on
+    // The master is considered busy while it is not in the idle state.
+    assign busy = (state != S_IDLE);
 endmodule

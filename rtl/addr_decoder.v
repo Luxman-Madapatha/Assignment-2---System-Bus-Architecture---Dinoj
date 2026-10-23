@@ -1,33 +1,104 @@
 //============================================================================
-// addr_decoder.v : 14-bit address decoder for 3 slaves
-//   Global address A[13:0] (16 KB space). The decoder only needs A[13:8],
-//   which is carried in the header beat.
+// arbiter.v : Fixed-priority, non-preemptive arbiter for 2 masters
 //
-//     Slave 0 : 4 KB  0x0000 - 0x0FFF   A[13:12] = 00
-//     Slave 1 : 4 KB  0x1000 - 0x1FFF   A[13:12] = 01
-//     Slave 2 : 2 KB  0x2000 - 0x27FF   A[13:12] = 10 and A[11] = 0
-//     unmapped:       0x2800 - 0x3FFF   -> hit = 0
+// The bus is a shared resource. Only one master may be granted ownership at a
+// time. This arbiter implements a simple static-priority policy:
+//   - Master 0 has the highest priority.
+//   - Master 1 has the lower priority.
+//   - Once a master is granted the bus, it retains ownership until it releases
+//     its request.
+//   - The arbiter is non-preemptive; it does not interrupt an ongoing transfer.
 //
-//   Outputs a one-hot select and a 2-bit select code
-//   (the code is what travels to the slave board: 0 = none).
+// State encoding:
+//   IDLE = 2'b00   -> no bus owner
+//   M0   = 2'b01   -> grant to master 0
+//   M1   = 2'b10   -> grant to master 1
+//
+// The state bit ordering is intentionally chosen to match the grant outputs:
+//   state[0] -> gnt0
+//   state[1] -> gnt1
+//
+// A synchronous rising-edge clock is used, with an asynchronous active-low
+// reset (rst_n) to bring the state machine back to IDLE.
 //============================================================================
-module addr_decoder (
-    input  wire [5:0] addr_hi,     // A[13:8]
-    output reg  [2:0] slave_sel,   // one-hot {S2,S1,S0}
-    output reg  [1:0] sel_code,    // 0:none 1:S0 2:S1 3:S2
-    output wire       hit          // address is mapped
+module arbiter (
+    input  wire clk,
+    input  wire rst_n,
+
+    // Request lines from the two masters.
+    // A request is asserted when the master wants to use the shared bus.
+    input  wire req0,
+    input  wire req1,
+
+    // Grant lines to the masters.
+    // Exactly one grant may be high at any given time.
+    output wire gnt0,
+    output wire gnt1,
+
+    // busy is asserted whenever the arbiter is in an active grant state.
+    output wire busy
 );
+
+    // State encoding matches the required grant outputs.
+    localparam [1:0] IDLE = 2'b00,
+                     M0   = 2'b01,
+                     M1   = 2'b10;
+
+    // State and next-state registers.
+    // The current state is the actual grant state of the arbiter.
+    reg [1:0] state, next_state;
+
+    // --------------------------------------------------------------------------
+    // Next-state generation.
+    // The arbiter gives priority to M0 whenever it requests the bus.
+    // If M0 is not active, M1 is granted when it requests the bus.
+    // If neither master requests the bus, the arbiter returns to IDLE.
+    // Once a grant is active, the bus remains owned by that master until the
+    // request is removed. This is non-preemptive arbitration.
+    // --------------------------------------------------------------------------
     always @(*) begin
-        slave_sel = 3'b000;
-        sel_code  = 2'd0;
-        case (addr_hi[5:4])                     // A[13:12]
-            2'b00: begin slave_sel = 3'b001; sel_code = 2'd1; end
-            2'b01: begin slave_sel = 3'b010; sel_code = 2'd2; end
-            2'b10: if (addr_hi[3] == 1'b0) begin // A[11] = 0 -> 2 KB
-                       slave_sel = 3'b100;  sel_code = 2'd3;
-                   end
-            default: ;                          // unmapped
+        case (state)
+            IDLE: begin
+                if      (req0) next_state = M0;     // Highest-priority request wins
+                else if (req1) next_state = M1;     // Lower-priority request wins next
+                else           next_state = IDLE;   // No request: bus idle
+            end
+
+            M0: begin
+                if      (req0) next_state = M0;     // M0 remains master while it keeps req0 high
+                else if (req1) next_state = M1;     // Allow handoff when M0 releases bus
+                else           next_state = IDLE;   // No active request: release bus
+            end
+
+            M1: begin
+                if      (req1) next_state = M1;     // M1 keeps ownership while it requests
+                else if (req0) next_state = M0;     // M0 can grab bus when M1 releases it
+                else           next_state = IDLE;   // No request: clear bus ownership
+            end
+
+            default: next_state = IDLE; // Safe default for unknown state values
         endcase
     end
-    assign hit = |slave_sel;
+
+    // --------------------------------------------------------------------------
+    // State register update.
+    // Synchronous state machine: the new state is loaded on each rising clock
+    // edge. The active-low reset returns the logic to IDLE immediately.
+    // --------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE; // Reset clears bus ownership
+        end else begin
+            state <= next_state; // Advance to next arbitration state
+        end
+    end
+
+    // --------------------------------------------------------------------------
+    // Grant outputs and busy flag.
+    // The state register itself is the grant vector. This keeps the implementation
+    // simple and avoids extra grant decoding logic.
+    // --------------------------------------------------------------------------
+    assign gnt0 = state[0]; // state = M0 -> gnt0 = 1
+    assign gnt1 = state[1]; // state = M1 -> gnt1 = 1
+    assign busy = |state;    // busy = 1 when in M0 or M1 state
 endmodule

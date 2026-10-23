@@ -1,152 +1,79 @@
 //============================================================================
-// bus_top.v : 8-bit multiplexed parallel bus  (2 masters, 3 slaves)
+// addr_decoder.v : 14-bit address decoder for 3 slaves
 //
-// Transaction (all beats use the same 8 data lines):
-//   beat 0  HEADER  = {RW, 1'b0, A[13:8]}    RW: 1 = write, 0 = read
-//   beat 1  ADDR_LO = A[7:0]
-//   beat 2  WDATA   (write only)
-//   -> bus returns m_ready (1-cycle pulse) with m_rdata for reads
+// This module decodes the upper address bits of a bus transaction and selects
+// which slave should respond. The system address space is 14 bits wide:
+//   A[13:0] = 16 KB total address space
 //
-// Contents:
-//   * arbiter       : fixed priority, M0 > M1, non-preemptive
-//   * master mux    : routes the granted master's beats
-//   * addr_decoder  : decodes the header beat, select latched per transaction
-//   * slave read-data mux + response generator
+// The memory map is defined as:
+//   Slave 0 : 4 KB  0x0000 - 0x0FFF   A[13:12] = 00
+//   Slave 1 : 4 KB  0x1000 - 0x1FFF   A[13:12] = 01
+//   Slave 2 : 2 KB  0x2000 - 0x27FF   A[13:12] = 10 and A[11] = 0
+//   unmapped:       0x2800 - 0x3FFF   -> hit = 0
 //
-// Slave interface is fixed latency (no slave ready wire, to fit the DE0
-// header pin budget): a slave's read data is valid on sN_rdata from one
-// clock after it samples the ADDR_LO beat and is held until its next read.
-// The bus returns m_ready two clocks after the last beat.
-// Unmapped addresses still complete (no bus lock-up): reads return
-// UNMAPPED_RDATA and dec_err is set.
+// The module outputs:
+//   - slave_sel : one-hot selection vector for the three slave devices
+//   - sel_code  : compact 2-bit encoded select value used by the bus
+//   - hit       : indicates whether the address is mapped to a valid slave
 //
-// Asynchronous active-low reset, rising-edge clock.
+// Note:
+//   The decoder only needs the upper address bits A[13:8], which are carried in
+//   the bus HEADER beat. The lower address bits are handled by the selected slave
+//   during the address-low phase of the transaction.
 //============================================================================
-module bus_top #(
-    parameter [7:0] UNMAPPED_RDATA = 8'hEE
-)(
-    input  wire       clk,
-    input  wire       rst_n,
-    // ---- Master 0 ----
-    input  wire       m0_req,
-    input  wire       m0_valid,
-    input  wire [7:0] m0_dout,
-    output wire       m0_gnt,
-    // ---- Master 1 ----
-    input  wire       m1_req,
-    input  wire       m1_valid,
-    input  wire [7:0] m1_dout,
-    output wire       m1_gnt,
-    // ---- Response to masters (shared, qualified by own gnt) ----
-    output reg  [7:0] m_rdata,
-    output reg        m_ready,
-    // ---- To slaves (broadcast data/valid + select code) ----
-    output reg  [7:0] s_wdata,
-    output reg        s_valid,
-    output reg  [1:0] s_sel,
-    // ---- From slaves ----
-    input  wire [7:0] s0_rdata,
-    input  wire [7:0] s1_rdata,
-    input  wire [7:0] s2_rdata,
-    // ---- Status ----
-    output wire       busy,
-    output reg        dec_err
+module addr_decoder (
+    input  wire [5:0] addr_hi,     // A[13:8] from the header beat
+
+    // One-hot selection vector for slave devices.
+    // bit 0 -> S0, bit 1 -> S1, bit 2 -> S2
+    output reg  [2:0] slave_sel,
+
+    // 2-bit encoded select code used by the bus.
+    // 0 = no slave selected, 1 = S0, 2 = S1, 3 = S2
+    output reg  [1:0] sel_code,
+
+    // hit = 1 only if the address maps to a valid slave region.
+    output wire       hit
 );
-    //------------------------------------------------------------------
-    // Arbiter
-    //------------------------------------------------------------------
-    wire gnt0, gnt1;
-    arbiter u_arbiter (
-        .clk(clk), .rst_n(rst_n),
-        .req0(m0_req), .req1(m1_req),
-        .gnt0(gnt0), .gnt1(gnt1), .busy(busy)
-    );
-    assign m0_gnt = gnt0;
-    assign m1_gnt = gnt1;
-    wire granted  = gnt0 | gnt1;
 
-    //------------------------------------------------------------------
-    // Master -> bus multiplexer (controlled by the grants)
-    //------------------------------------------------------------------
-    wire       mux_valid = gnt0 ? m0_valid : (gnt1 ? m1_valid : 1'b0);
-    wire [7:0] mux_data  = gnt0 ? m0_dout  : (gnt1 ? m1_dout  : 8'h00);
-
-    //------------------------------------------------------------------
-    // Address decoder (combinational on the header beat)
-    //------------------------------------------------------------------
-    wire [2:0] dec_onehot;
-    wire [1:0] dec_code;
-    wire       dec_hit;
-    addr_decoder u_decoder (
-        .addr_hi(mux_data[5:0]),
-        .slave_sel(dec_onehot), .sel_code(dec_code), .hit(dec_hit)
-    );
-
-    //------------------------------------------------------------------
-    // Transaction tracking
-    //------------------------------------------------------------------
-    reg  [1:0] beat;        // beats received in the current transaction
-    reg        rw_q;        // latched RW bit
-    reg        hit_q;       // latched decode result
-    reg  [1:0] resp_pipe;   // response delay line (slave latency)
-
-    wire hdr_beat  = mux_valid & (beat == 2'd0);
-    wire last_beat = mux_valid & ((~rw_q & (beat == 2'd1)) |
-                                  ( rw_q & (beat == 2'd2)));
-
-    // Slave -> bus read-data multiplexer (by latched select code)
-    reg [7:0] s_rdata_mux;
+    // --------------------------------------------------------------------------
+    // Decode logic.
+    // This is a purely combinational assignment: the output depends immediately on
+    // the current value of addr_hi.
+    // --------------------------------------------------------------------------
     always @(*) begin
-        case (s_sel)
-            2'd1:    s_rdata_mux = s0_rdata;
-            2'd2:    s_rdata_mux = s1_rdata;
-            2'd3:    s_rdata_mux = s2_rdata;
-            default: s_rdata_mux = 8'h00;
+        slave_sel = 3'b000; // Default: no slave selected
+        sel_code  = 2'd0;  // Default code: no selection
+
+        case (addr_hi[5:4]) // Decode A[13:12]
+            2'b00: begin
+                slave_sel = 3'b001; // S0 selected
+                sel_code = 2'd1;    // encode S0 as 1
+            end
+
+            2'b01: begin
+                slave_sel = 3'b010; // S1 selected
+                sel_code = 2'd2;    // encode S1 as 2
+            end
+
+            2'b10: begin
+                // S2 occupies only half of the 2 KB segment when A[11] = 0.
+                // The address must satisfy A[11] = 0 to remain within S2.
+                if (addr_hi[3] == 1'b0) begin
+                    slave_sel = 3'b100; // S2 selected
+                    sel_code = 2'd3;    // encode S2 as 3
+                end
+            end
+
+            default: begin
+                // All other address groups are unmapped.
+                // Leave slave_sel and sel_code at the default values.
+            end
         endcase
     end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            s_wdata   <= 8'h00;
-            s_valid   <= 1'b0;
-            s_sel     <= 2'd0;
-            m_rdata   <= 8'h00;
-            m_ready   <= 1'b0;
-            beat      <= 2'd0;
-            rw_q      <= 1'b0;
-            hit_q     <= 1'b0;
-            resp_pipe <= 2'b00;
-            dec_err   <= 1'b0;
-        end else begin
-            // forward the granted master's beat to all slaves (registered)
-            s_wdata   <= mux_data;
-            s_valid   <= mux_valid;
-            m_ready   <= 1'b0;
-            resp_pipe <= {resp_pipe[0], last_beat};
-
-            if (hdr_beat) begin                 // decode + latch select
-                rw_q    <= mux_data[7];
-                hit_q   <= dec_hit;
-                s_sel   <= dec_code;            // aligned with the header beat
-                dec_err <= ~dec_hit;
-                beat    <= 2'd1;
-            end else if (mux_valid && beat != 2'd3) begin
-                beat    <= beat + 2'd1;
-            end
-
-            if (resp_pipe[1]) begin             // complete the transaction
-                m_ready <= 1'b1;
-                m_rdata <= rw_q  ? 8'h00 :
-                           hit_q ? s_rdata_mux : UNMAPPED_RDATA;
-                s_sel   <= 2'd0;
-                beat    <= 2'd0;
-            end
-
-            if (!granted) begin                 // safety: bus released
-                s_sel     <= 2'd0;
-                beat      <= 2'd0;
-                resp_pipe <= 2'b00;
-            end
-        end
-    end
+    // A valid address is one that maps to a slave region.
+    // Since the one-hot vector is all zero for unmapped regions, OR-reducing it
+    // gives a hit indication.
+    assign hit = |slave_sel;
 endmodule
